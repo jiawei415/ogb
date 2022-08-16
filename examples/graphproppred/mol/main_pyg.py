@@ -1,19 +1,41 @@
+import os
 import torch
 from torch_geometric.loader import DataLoader
 import torch.optim as optim
 import torch.nn.functional as F
-from gnn import GNN
+from .gnn import GNN
 
 from tqdm import tqdm
 import argparse
 import time
 import numpy as np
+import random
 
 ### importing OGB
 from ogb.graphproppred import PygGraphPropPredDataset, Evaluator
+from ogb.utils.logger import logger, configure, dump_params
 
 cls_criterion = torch.nn.BCEWithLogitsLoss()
 reg_criterion = torch.nn.MSELoss()
+
+def set_logger(args):
+    time_tag = time.strftime("%Y_%m_%d__%H_%M_%S", time.localtime())
+    file_name = f"obg_{args.gnn}_{args.dataset}_{time_tag}"
+    dump_dir = os.path.expanduser(os.path.join(args.filename, file_name))
+    format_strings = ["stdout", "log", "csv"]
+    configure(logger, dump_dir, format_strings)
+    dump_params(logger.get_dir(), vars(args))
+
+def set_global_seed(args):
+    seed = args.seed
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available and args.device >= 0:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            torch.cuda.manual_seed(seed)
 
 def train(model, device, loader, optimizer, task_type):
     model.train()
@@ -59,8 +81,7 @@ def eval(model, device, loader, evaluator):
 
     return evaluator.eval(input_dict)
 
-
-def main():
+def get_args():
     # Training settings
     parser = argparse.ArgumentParser(description='GNN baselines on ogbgmol* data with Pytorch Geometrics')
     parser.add_argument('--device', type=int, default=0,
@@ -75,7 +96,8 @@ def main():
                         help='dimensionality of hidden units in GNNs (default: 300)')
     parser.add_argument('--batch_size', type=int, default=32,
                         help='input batch size for training (default: 32)')
-    parser.add_argument('--epochs', type=int, default=100,
+    parser.add_argument("--runs", type=int, default=5, help="number of runs")
+    parser.add_argument('--epochs', type=int, default=1000,
                         help='number of epochs to train (default: 100)')
     parser.add_argument('--num_workers', type=int, default=0,
                         help='number of workers (default: 0)')
@@ -84,14 +106,30 @@ def main():
 
     parser.add_argument('--feature', type=str, default="full",
                         help='full feature or simple feature')
-    parser.add_argument('--filename', type=str, default="",
+    parser.add_argument('--filename', type=str, default="./results",
                         help='filename to output result (default: )')
-    args = parser.parse_args()
 
+    parser.add_argument("--seed", type=int, default=2022)
+    parser.add_argument("--taiji", action="store_true", help="debug")
+    args = parser.parse_args()
+    return args
+
+def main(args, run_id=0):
     device = torch.device("cuda:" + str(args.device)) if torch.cuda.is_available() else torch.device("cpu")
 
+    if args.taiji:
+        args.dataset_path = "/apdcephfs/share_1150325/ztjiaweixu-graph/dataset/ogb"
+        args.filename = f"/apdcephfs/share_1150325/ztjiaweixu-graph/dumps/ogb/{args.dataset}"
+    else:
+        args.dataset_path =  "~/.ogb/dataset"
+        args.filename = f"{args.filename}/{args.dataset}"
+    args.seed += run_id
+    set_global_seed(args)
+    if run_id == 0:
+        set_logger(args)
+
     ### automatic dataloading and splitting
-    dataset = PygGraphPropPredDataset(name = args.dataset)
+    dataset = PygGraphPropPredDataset(name=args.dataset, root=args.dataset_path)
 
     if args.feature == 'full':
         pass 
@@ -138,6 +176,12 @@ def main():
         test_perf = eval(model, device, test_loader, evaluator)
 
         print({'Train': train_perf, 'Validation': valid_perf, 'Test': test_perf})
+        logger.record("Run", run_id)
+        logger.record("Epoch", epoch)
+        logger.record("Train", train_perf[dataset.eval_metric])
+        logger.record("Validation", valid_perf[dataset.eval_metric])
+        logger.record("Test", test_perf[dataset.eval_metric])
+        logger.dump(epoch)
 
         train_curve.append(train_perf[dataset.eval_metric])
         valid_curve.append(valid_perf[dataset.eval_metric])
@@ -150,13 +194,27 @@ def main():
         best_val_epoch = np.argmin(np.array(valid_curve))
         best_train = min(train_curve)
 
-    print('Finished training!')
-    print('Best validation score: {}'.format(valid_curve[best_val_epoch]))
-    print('Test score: {}'.format(test_curve[best_val_epoch]))
+    logger.info(f'Finished training run {run_id}!')
+    logger.info(
+        f'Best val epoch: {best_val_epoch}, \
+        Val Score: {valid_curve[best_val_epoch]}, \
+        Test Score: {test_curve[best_val_epoch]}, \
+        Train Score: {train_curve[best_val_epoch]}'
+    )
 
-    if not args.filename == '':
-        torch.save({'Val': valid_curve[best_val_epoch], 'Test': test_curve[best_val_epoch], 'Train': train_curve[best_val_epoch], 'BestTrain': best_train}, args.filename)
 
+    # if not args.filename == '':
+    #     torch.save({'Val': valid_curve[best_val_epoch], 'Test': test_curve[best_val_epoch], 'Train': train_curve[best_val_epoch], 'BestTrain': best_train}, args.filename)
+
+    return test_curve[best_val_epoch]
 
 if __name__ == "__main__":
-    main()
+    args = get_args()
+    all_runs = []
+    for i in range(args.runs):
+        all_runs.append(main(args, i))
+        mean_acc = np.mean(all_runs)
+        std_acc = np.std(all_runs)
+        acc_str = ", ".join([f"{acc :.4f}" for acc in all_runs])
+        logger.info(f"All runs: [{acc_str}]")
+        logger.info(f"Average Test Accuracy: {mean_acc :.4f}(mean) {std_acc: .4f}(std)")
