@@ -5,6 +5,7 @@ from torch_geometric.nn import global_mean_pool, global_add_pool
 from ogb.graphproppred.mol_encoder import AtomEncoder,BondEncoder
 from torch_geometric.utils import degree
 
+from torch_geometric.nn import GCNConv as GCNConvVanilla
 import math
 
 ### GIN convolution along the graph structure
@@ -98,10 +99,13 @@ class GNN_node(torch.nn.Module):
                 self.convs.append(GINConv(emb_dim))
             elif gnn_type == 'gcn':
                 self.convs.append(GCNConv(emb_dim))
+            elif gnn_type == 'gcn-vanilla':
+                self.convs.append(GCNConvVanilla(emb_dim, emb_dim))
             else:
                 raise ValueError('Undefined GNN type called {}'.format(gnn_type))
 
             self.batch_norms.append(torch.nn.BatchNorm1d(emb_dim))
+        self.gnn_type = gnn_type
 
     def forward(self, batched_data):
         x, edge_index, edge_attr, batch = batched_data.x, batched_data.edge_index, batched_data.edge_attr, batched_data.batch
@@ -110,8 +114,10 @@ class GNN_node(torch.nn.Module):
 
         h_list = [self.atom_encoder(x)]
         for layer in range(self.num_layer):
-
-            h = self.convs[layer](h_list[layer], edge_index, edge_attr)
+            if self.gnn_type == "gcn-vanilla":
+                h = self.convs[layer](h_list[layer], edge_index)
+            else:
+                h = self.convs[layer](h_list[layer], edge_index, edge_attr)
             h = self.batch_norms[layer](h)
 
             if layer == self.num_layer - 1:
